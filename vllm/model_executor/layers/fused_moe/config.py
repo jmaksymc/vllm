@@ -1420,8 +1420,10 @@ class FusedMoEConfig:
         from vllm._aiter_ops import rocm_aiter_ops
 
         tp_size = self.moe_parallel_config.tp_size
-        assert self.intermediate_size % tp_size == 0
-        self.intermediate_size_per_partition = self.intermediate_size // tp_size
+        self.intermediate_size_per_partition = cdiv(self.intermediate_size, tp_size)
+        if self.intermediate_size % tp_size:
+            # Uneven TP: the last ranks own zero-padded partial shards.
+            self.tp_shard_with_padding = True
 
         if self.dp_size > 1:
             logger.debug_once(

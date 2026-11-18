@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+import math
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -59,12 +60,14 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
 from .interfaces import (
@@ -72,6 +75,7 @@ from .interfaces import (
     MixtureOfExperts,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsPaddedTP,
     SupportsPP,
     SupportsQuant,
 )
@@ -290,6 +294,55 @@ def gemma4_routing_function_torch(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def _padded_tp_head_counts(
+    num_heads: int, num_kv_heads: int, tp_size: int
+) -> tuple[int, int]:
+    """Smallest zero-padded `(num_heads, num_kv_heads)` that TP splits evenly.
+
+    Dummy query heads are appended to each KV head's query group and dummy
+    groups after the real ones, so a rank's query heads always attend to the
+    KV heads it holds. KV heads are either split (padded to a multiple of
+    `tp_size`) or replicated (padded to a divisor of `tp_size`), whichever
+    needs fewer query heads.
+    """
+    q_per_kv = num_heads // num_kv_heads
+    split_kv = round_up(num_kv_heads, tp_size)
+    candidates = [(split_kv * q_per_kv, split_kv)]
+    candidates += [
+        (kv * round_up(q_per_kv, tp_size // kv), kv)
+        for kv in range(num_kv_heads, tp_size + 1)
+        if tp_size % kv == 0
+    ]
+    return min(candidates)
+
+
+def _pad_head_groups(
+    weight: torch.Tensor,
+    dim: int,
+    groups: int,
+    per_group: int,
+    padded_groups: int,
+    padded_per_group: int,
+) -> torch.Tensor:
+    """Zero-pad `weight` along `dim`, laid out as `[groups][per_group][head]`."""
+    if (groups, per_group) == (padded_groups, padded_per_group):
+        return weight
+    grouped = weight.unflatten(dim, (groups, per_group, -1))
+    padded = grouped.new_zeros(
+        *grouped.shape[:dim],
+        padded_groups,
+        padded_per_group,
+        *grouped.shape[dim + 2 :],
+    )
+    padded.narrow(dim, 0, groups).narrow(dim + 1, 0, per_group).copy_(grouped)
+    return padded.flatten(dim, dim + 2)
+
+
+def _vocab_padding_size() -> int:
+    """Vocab padding that keeps the padded vocab divisible by the TP size."""
+    return math.lcm(DEFAULT_VOCAB_PADDING_SIZE, get_tensor_model_parallel_world_size())
+
+
 def _get_text_config(config):
     """Dereference text_config if config is a nested Gemma4Config.
 
@@ -439,10 +492,18 @@ class Gemma4Attention(nn.Module):
 
         tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.total_num_heads = num_heads
+        # Checkpoint head counts; TP shards the zero-padded totals below.
+        self.ckpt_num_heads = num_heads
+        self.ckpt_num_kv_heads = num_kv_heads
+        self.total_num_heads, self.total_num_kv_heads = _padded_tp_head_counts(
+            num_heads, num_kv_heads, tp_size
+        )
+        self.pads_heads = (self.total_num_heads, self.total_num_kv_heads) != (
+            num_heads,
+            num_kv_heads,
+        )
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= tp_size:
             assert self.total_num_kv_heads % tp_size == 0
         else:
@@ -576,6 +637,27 @@ class Gemma4Attention(nn.Module):
             # per-query here.
             mm_prefix_clamp_sliding_window=self.is_sliding,
             prefix=f"{prefix}.attn",
+        )
+
+    def pad_checkpoint_weight(self, proj: str, weight: torch.Tensor) -> torch.Tensor:
+        """Zero-pad a checkpoint q/k/v/o projection to the padded head layout.
+
+        Dummy heads get zero q/k/v rows, so their attention output is zero, and
+        zero `o_proj` columns, so they add nothing to the layer output.
+        """
+        if not self.pads_heads:
+            return weight
+        if proj in ("k_proj", "v_proj"):
+            return _pad_head_groups(
+                weight, 0, self.ckpt_num_kv_heads, 1, self.total_num_kv_heads, 1
+            )
+        return _pad_head_groups(
+            weight,
+            1 if proj == "o_proj" else 0,
+            self.ckpt_num_kv_heads,
+            self.ckpt_num_heads // self.ckpt_num_kv_heads,
+            self.total_num_kv_heads,
+            self.total_num_heads // self.total_num_kv_heads,
         )
 
     def forward(
@@ -1069,6 +1151,7 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            padding_size=_vocab_padding_size(),
             quant_config=quant_config,
             prefix=f"{prefix}.embed_tokens",
         )
@@ -1085,6 +1168,7 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             self.embed_tokens_per_layer = VocabParallelEmbedding(
                 self.vocab_size_per_layer_input,
                 total_ple_dim,
+                padding_size=_vocab_padding_size(),
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens_per_layer",
             )
@@ -1145,6 +1229,16 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             ),
             prefix=f"{prefix}.layers",
         )
+        if (quant_config is not None or vllm_config.lora_config is not None) and any(
+            layer.self_attn.pads_heads
+            for layer in self.layers
+            if not isinstance(layer, PPMissingLayer)
+        ):
+            raise NotImplementedError(
+                "Gemma4 zero-pads the attention heads that "
+                f"TP={get_tensor_model_parallel_world_size()} does not divide; "
+                "this is only supported for unquantized checkpoints without LoRA."
+            )
         # Final norm: output = norm(x) * weight
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -1457,13 +1551,37 @@ class Gemma4Model(nn.Module, EagleModelMixin, SupportsQuant):
             return hidden_states, aux_hidden_states
         return hidden_states
 
+    def _pad_attention_heads(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        for name, weight in weights:
+            parts = name.split(".")
+            if (
+                len(parts) == 5
+                and parts[0] == "layers"
+                and parts[2] == "self_attn"
+                and parts[3] in ("q_proj", "k_proj", "v_proj", "o_proj")
+                and not (parts[3] == "o_proj" and parts[4] == "bias")
+            ):
+                layer = self.layers[int(parts[1])]
+                if not isinstance(layer, PPMissingLayer):
+                    weight = layer.self_attn.pad_checkpoint_weight(parts[3], weight)
+            yield name, weight
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            self._pad_attention_heads(weights), mapper=self.hf_to_vllm_mapper
+        )
 
 
 class Gemma4ForCausalLM(
-    nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts, SupportsEagle3
+    nn.Module,
+    SupportsLoRA,
+    SupportsPP,
+    SupportsPaddedTP,
+    MixtureOfExperts,
+    SupportsEagle3,
 ):
     is_3d_moe_weight: ClassVar[bool] = True
 
@@ -1516,6 +1634,7 @@ class Gemma4ForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            padding_size=_vocab_padding_size(),
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )

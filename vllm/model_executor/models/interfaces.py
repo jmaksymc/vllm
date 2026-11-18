@@ -933,6 +933,28 @@ def supports_hc_sp(
 
 
 @runtime_checkable
+class SupportsPaddedTP(Protocol):
+    """The model zero-pads the attention heads that the TP size does not
+    divide, so the attention-head divisibility check is skipped for it."""
+
+    supports_padded_tp: ClassVar[Literal[True]] = True
+
+
+@overload
+def supports_padded_tp(model: type[object]) -> TypeIs[type[SupportsPaddedTP]]: ...
+
+
+@overload
+def supports_padded_tp(model: object) -> TypeIs[SupportsPaddedTP]: ...
+
+
+def supports_padded_tp(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsPaddedTP]] | TypeIs[SupportsPaddedTP]:
+    return getattr(model, "supports_padded_tp", False)
+
+
+@runtime_checkable
 class HasInnerState(Protocol):
     """The interface required for all models that has inner state."""
 

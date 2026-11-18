@@ -166,6 +166,16 @@ class RoutedExperts(PluggableLayer):
             self.quant_config,
             self.moe_config,
         )
+        if moe_config.intermediate_size % moe_config.tp_size and (
+            not isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+            or moe_config.has_bias
+        ):
+            raise NotImplementedError(
+                f"{layer_name}: intermediate size {moe_config.intermediate_size} "
+                f"is not divisible by the MoE TP size {moe_config.tp_size}. "
+                "Zero-padded TP shards are only supported for unquantized "
+                "experts without bias."
+            )
 
         # Only set when FSE go through online quantization, with pre-quantized routed.
         self.shared_expert_online_loader = None

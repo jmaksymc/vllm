@@ -560,6 +560,9 @@ void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num) {
     case 4:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 4>(ctx, data, elem_num);
       break;
+    case 6:
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 6>(ctx, data, elem_num);
+      break;
     case 8:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 8>(ctx, data, elem_num);
       break;

@@ -85,6 +85,7 @@ from .interfaces import (
     SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMultiModal,
+    SupportsPaddedTP,
     SupportsPP,
     SupportsQuant,
 )
@@ -1028,6 +1029,7 @@ class Gemma4ForConditionalGeneration(
     SupportsMultiModal,
     SupportsQuant,
     SupportsPP,
+    SupportsPaddedTP,
     SupportsLoRA,
     SupportsEagle3,
     SupportsEncoderCudaGraph,

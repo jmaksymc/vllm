@@ -55,6 +55,7 @@ from .interfaces import (
     supports_multimodal,
     supports_multimodal_encoder_tp_data,
     supports_multimodal_raw_input_only,
+    supports_padded_tp,
     supports_pp,
     supports_replayssm,
     supports_transcription,
@@ -969,6 +970,7 @@ class _ModelInfo:
     supports_pp: bool
     supports_lora: bool
     supports_hc_sp: bool
+    supports_padded_tp: bool
     has_inner_state: bool
     is_attention_free: bool
     is_hybrid: bool
@@ -1005,6 +1007,7 @@ class _ModelInfo:
             supports_pp=supports_pp(model),
             supports_lora=supports_lora(model),
             supports_hc_sp=supports_hc_sp(model),
+            supports_padded_tp=supports_padded_tp(model),
             has_inner_state=has_inner_state(model),
             is_attention_free=is_attention_free(model),
             is_hybrid=is_hybrid(model),
@@ -1604,6 +1607,14 @@ class _ModelRegistry:
         """Check support for HC SP without changing MoE parallelism."""
         model_info, _ = self.inspect_model_cls(architectures, model_config)
         return model_info.supports_hc_sp
+
+    def is_padded_tp_supported_model(
+        self,
+        architectures: str | list[str],
+        model_config: ModelConfig,
+    ) -> bool:
+        model_info, _ = self.inspect_model_cls(architectures, model_config)
+        return model_info.supports_padded_tp
 
     def is_transcription_only_model(
         self,
